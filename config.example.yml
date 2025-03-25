@@ -1,0 +1,7 @@
+minio:
+  # endpoint: "minio-ott.nsc.iudanet.com:443"
+  endpoint: "minio.nsc.iudanet.com:443"
+
+  accessKey: "accessKey"
+  secretKey: "secretKey"
+  useSSL: true

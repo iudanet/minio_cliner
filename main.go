@@ -19,7 +19,9 @@ const (
 )
 
 var (
-	version = "dev" // задается при сборке через -ldflags
+	version    = "dev" // задается при сборке через -ldflags
+	bucketName string  // Добавим переменную для хранения имени бакета
+
 )
 
 type Config struct {
@@ -37,6 +39,7 @@ func main() {
 
 	flag.StringVar(&configFile, "config", "", "Path to config file")
 	flag.BoolVar(&showVersion, "version", false, "Show version and exit")
+	flag.StringVar(&bucketName, "bucket", "", "Specific bucket name to process") // Добавим новый флаг
 	flag.Parse()
 
 	if showVersion {
@@ -124,31 +127,47 @@ func listBuckets(client *minio.Client) {
 }
 
 func checkLifecycle(client *minio.Client) {
+	if bucketName != "" {
+		checkSingleBucket(client, bucketName)
+		return
+	}
+
 	buckets, err := client.ListBuckets(context.Background())
 	if err != nil {
 		log.Fatalf("Error listing buckets: %v", err)
 	}
 
 	for _, bucket := range buckets {
-		lc, err := client.GetBucketLifecycle(context.Background(), bucket.Name)
-		if err != nil {
-			if minio.ToErrorResponse(err).Code == "NoSuchLifecycleConfiguration" {
-				fmt.Printf("Bucket %s: ❌ No lifecycle policy\n", bucket.Name)
-				continue
-			}
-			fmt.Printf("Bucket %s: ⚠️ Error checking lifecycle: %v\n", bucket.Name, err)
-			continue
-		}
-
-		if hasCorrectPolicy(lc) {
-			fmt.Printf("Bucket %s: ✅ Correct policy exists\n", bucket.Name)
-		} else {
-			fmt.Printf("Bucket %s: ⚠️ Policy exists but not configured properly\n", bucket.Name)
-		}
+		checkSingleBucket(client, bucket.Name)
 	}
 }
 
+func checkSingleBucket(client *minio.Client, name string) {
+	lc, err := client.GetBucketLifecycle(context.Background(), name)
+	if err != nil {
+		if minio.ToErrorResponse(err).Code == "NoSuchLifecycleConfiguration" {
+			fmt.Printf("Bucket %s: ❌ No lifecycle policy\n", name)
+			return
+		}
+		fmt.Printf("Bucket %s: ⚠️ Error checking lifecycle: %v\n", name, err)
+		return
+	}
+
+	if hasCorrectPolicy(lc) {
+		fmt.Printf("Bucket %s: ✅ Correct policy exists\n", name)
+	} else {
+		fmt.Printf("Bucket %s: ⚠️ Policy exists but not configured properly\n", name)
+	}
+}
 func applyLifecycle(client *minio.Client) {
+	if bucketName != "" {
+		if !bucketExists(client, bucketName) {
+			log.Fatalf("Bucket %s does not exist", bucketName)
+		}
+		processBucket(client, bucketName)
+		return
+	}
+
 	buckets, err := client.ListBuckets(context.Background())
 	if err != nil {
 		log.Fatalf("Error listing buckets: %v", err)
@@ -159,6 +178,15 @@ func applyLifecycle(client *minio.Client) {
 	}
 }
 
+// Вспомогательная функция для проверки существования бакета
+func bucketExists(client *minio.Client, name string) bool {
+	exists, err := client.BucketExists(context.Background(), name)
+	if err != nil {
+		log.Printf("Error checking bucket existence: %v", err)
+		return false
+	}
+	return exists
+}
 func processBucket(client *minio.Client, bucketName string) {
 	ctx := context.Background()
 
