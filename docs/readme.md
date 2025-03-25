@@ -108,7 +108,7 @@ func main() {
 	}
 }
 
-func processBucket(client *minio.Client, bucketName string) {
+func processBucket(client MinioClientInterface, bucketName string) {
 	ctx := context.Background()
 
 	// Получение текущей политики жизненного цикла
@@ -160,7 +160,7 @@ func hasCorrectPolicy(lc *lifecycle.Configuration) bool {
 	return false
 }
 
-func updateLifecycle(client *minio.Client, bucketName string, lc *lifecycle.Configuration) {
+func updateLifecycle(client MinioClientInterface, bucketName string, lc *lifecycle.Configuration) {
 	// Удаляем старые правила с таким же ID
 	var newRules []lifecycle.Rule
 	for _, rule := range lc.Rules {
