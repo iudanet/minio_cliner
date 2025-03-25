@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sync"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -326,7 +325,7 @@ func cleanVersions(client MinioClientInterface) {
 
 func cleanSingleBucket(client MinioClientInterface, bucket string) {
 	ctx := context.Background()
-
+	log.Printf("Bucket %s: ⌛️ Cleaning versions starting", bucket)
 	exists, err := client.BucketExists(ctx, bucket)
 	if err != nil {
 		log.Printf("Error checking bucket %s existence: %v", bucket, err)
@@ -341,38 +340,47 @@ func cleanSingleBucket(client MinioClientInterface, bucket string) {
 		WithVersions: true,
 		Recursive:    true,
 	}
-	objectsCh := client.ListObjects(ctx, bucket, listOpts)
 
-	removeObjectsCh := make(chan minio.ObjectInfo, 100)
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		defer close(removeObjectsCh)
-		count := 0
-		for obj := range objectsCh {
-			if !obj.IsLatest {
-				if dryRun {
-					fmt.Printf("[Dry Run] Would delete: %s (Version ID: %s)\n",
-						obj.Key, obj.VersionID)
-					count++
-				} else {
-					removeObjectsCh <- obj
-				}
-			}
-		}
-		if dryRun {
-			log.Printf("[Dry Run] Bucket %s: Found %d non-current versions to delete",
-				bucket, count)
-		}
-	}()
+	// Счетчик для всех режимов
+	var totalCount int
 
 	if dryRun {
-		wg.Wait()
+		// Второй проход только для dry-run: вывод деталей
+
+		objectsCh := client.ListObjects(ctx, bucket, listOpts)
+		for obj := range objectsCh {
+			if !obj.IsLatest {
+				totalCount++
+				fmt.Printf("[Dry Run] Would delete: %s (Version ID: %s)\n",
+					obj.Key, obj.VersionID)
+			}
+		}
+		log.Printf("Bucket %s: Planning to delete %d non-current versions", bucket, totalCount)
 		log.Printf("Bucket %s: ✅ Dry run completed", bucket)
 		return
 	}
+
+	// Реальный режим: вывод общего количества перед удалением
+
+	// Второй проход: удаление объектов
+	objectsChForDelete := client.ListObjects(ctx, bucket, listOpts)
+	for obj := range objectsChForDelete {
+		if !obj.IsLatest {
+			totalCount++
+		}
+	}
+	log.Printf("Bucket %s: Deleting %d non-current versions", bucket, totalCount)
+
+	removeObjectsCh := make(chan minio.ObjectInfo, 100)
+
+	go func() {
+		defer close(removeObjectsCh)
+		for obj := range objectsChForDelete {
+			if !obj.IsLatest {
+				removeObjectsCh <- obj
+			}
+		}
+	}()
 
 	errorCh := client.RemoveObjects(ctx, bucket, removeObjectsCh, minio.RemoveObjectsOptions{})
 
@@ -383,10 +391,9 @@ func cleanSingleBucket(client MinioClientInterface, bucket string) {
 		hasErrors = true
 	}
 
-	wg.Wait()
 	if hasErrors {
 		log.Printf("Bucket %s: ❌ Clean completed with errors", bucket)
 	} else {
-		log.Printf("Bucket %s: ✅ Successfully cleaned non-current versions", bucket)
+		log.Printf("Bucket %s: ✅ Successfully deleted %d versions", bucket, totalCount)
 	}
 }
