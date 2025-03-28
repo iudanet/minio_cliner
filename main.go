@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -43,6 +46,9 @@ type Config struct {
 		SecretKey string `mapstructure:"secretKey"`
 		UseSSL    bool   `mapstructure:"useSSL"`
 	} `mapstructure:"minio"`
+	Cleaner struct {
+		MaxObjectsPerRun int `mapstructure:"maxObjectsPerRun"`
+	} `mapstructure:"cleaner"`
 }
 
 func main() {
@@ -101,7 +107,7 @@ func main() {
 	case "apply":
 		applyLifecycle(minioClient)
 	case "clean": // Добавлен новый кейс
-		cleanVersions(minioClient)
+		cleanVersions(minioClient, cfg)
 	default:
 		flag.Usage()
 		log.Fatalf("\nError: unknown command: %s", args[0])
@@ -111,6 +117,8 @@ func main() {
 func loadConfig(configPath string) (*Config, error) {
 	v := viper.New()
 	v.SetConfigType("yaml")
+	// Устанавливаем значения по умолчанию
+	v.SetDefault("cleaner.maxObjectsPerRun", 100)
 
 	if configPath != "" {
 		v.SetConfigFile(configPath)
@@ -307,9 +315,9 @@ func updateLifecycleConfig(existing *lifecycle.Configuration) *lifecycle.Configu
 	}
 }
 
-func cleanVersions(client MinioClientInterface) {
+func cleanVersions(client MinioClientInterface, cfg *Config) {
 	if bucketName != "" {
-		cleanSingleBucket(client, bucketName)
+		cleanSingleBucket(client, bucketName, cfg)
 		return
 	}
 
@@ -319,12 +327,14 @@ func cleanVersions(client MinioClientInterface) {
 	}
 
 	for _, bucket := range buckets {
-		cleanSingleBucket(client, bucket.Name)
+		cleanSingleBucket(client, bucket.Name, cfg)
 	}
 }
 
-func cleanSingleBucket(client MinioClientInterface, bucket string) {
-	ctx := context.Background()
+func cleanSingleBucket(client MinioClientInterface, bucket string, cfg *Config) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // Таймаут 5 минут
+	defer cancel()
+
 	log.Printf("Bucket %s: ⌛️ Cleaning versions starting", bucket)
 	exists, err := client.BucketExists(ctx, bucket)
 	if err != nil {
@@ -341,59 +351,84 @@ func cleanSingleBucket(client MinioClientInterface, bucket string) {
 		Recursive:    true,
 	}
 
-	// Счетчик для всех режимов
-	var totalCount int
+	maxObjectsPerRun := cfg.Cleaner.MaxObjectsPerRun
+	var (
+		totalCount     int64 // Атомарный счетчик для общего количества
+		processedCount int   // Счетчик обработанных в этом прогоне
+		wg             sync.WaitGroup
+	)
 
-	if dryRun {
-		// Второй проход только для dry-run: вывод деталей
+	objectsCh := client.ListObjects(ctx, bucket, listOpts)
+	removeObjectsCh := make(chan minio.ObjectInfo, maxObjectsPerRun)
 
-		objectsCh := client.ListObjects(ctx, bucket, listOpts)
-		for obj := range objectsCh {
-			if !obj.IsLatest {
-				totalCount++
-				fmt.Printf("[Dry Run] Would delete: %s (Version ID: %s)\n",
-					obj.Key, obj.VersionID)
-			}
-		}
-		log.Printf("Bucket %s: Planning to delete %d non-current versions", bucket, totalCount)
-		log.Printf("Bucket %s: ✅ Dry run completed", bucket)
-		return
-	}
-
-	// Реальный режим: вывод общего количества перед удалением
-
-	// Второй проход: удаление объектов
-	objectsChForDelete := client.ListObjects(ctx, bucket, listOpts)
-	for obj := range objectsChForDelete {
-		if !obj.IsLatest {
-			totalCount++
-		}
-	}
-	log.Printf("Bucket %s: Deleting %d non-current versions", bucket, totalCount)
-
-	removeObjectsCh := make(chan minio.ObjectInfo, 100)
-
+	// Горутина для чтения объектов и принятия решений
+	wg.Add(1)
 	go func() {
-		defer close(removeObjectsCh)
-		for obj := range objectsChForDelete {
+		defer wg.Done()
+		defer close(removeObjectsCh) // Закрываем канал после завершения
+
+		for obj := range objectsCh {
+			atomic.AddInt64(&totalCount, 1)
 			if !obj.IsLatest {
-				removeObjectsCh <- obj
+
+				select {
+				case removeObjectsCh <- obj:
+					processedCount++
+				case <-ctx.Done():
+					return // Прерываем по таймауту
+				}
+
+				if processedCount >= maxObjectsPerRun {
+					log.Printf("Bucket %s: Reached limit of %d objects for this run", bucket, maxObjectsPerRun)
+					return
+					// Не прерываем, чтобы продолжить подсчет общего количества
+				}
 			}
 		}
 	}()
 
-	errorCh := client.RemoveObjects(ctx, bucket, removeObjectsCh, minio.RemoveObjectsOptions{})
+	// Горутина для обработки ошибок удаления
+	errorCh := make(chan minio.RemoveObjectError)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(errorCh)
 
+		if !dryRun {
+			for err := range client.RemoveObjects(ctx, bucket, removeObjectsCh, minio.RemoveObjectsOptions{}) {
+				errorCh <- err
+			}
+		}
+	}()
+
+	// Горутина для сбора ошибок
 	hasErrors := false
-	for e := range errorCh {
-		log.Printf("Failed to remove %s (version %s): %v",
-			e.ObjectName, e.VersionID, e.Err)
-		hasErrors = true
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for e := range errorCh {
+			log.Printf("Failed to remove %s (version %s): %v",
+				e.ObjectName, e.VersionID, e.Err)
+			hasErrors = true
+		}
+	}()
 
-	if hasErrors {
-		log.Printf("Bucket %s: ❌ Clean completed with errors", bucket)
+	// Ожидаем завершения всех горутин
+	wg.Wait()
+
+	// Логирование результатов
+	total := atomic.LoadInt64(&totalCount)
+	if dryRun {
+		log.Printf("Bucket %s: Planning to delete %d non-current versions (would process %d now)",
+			bucket, processedCount, total)
+		log.Printf("Bucket %s: ✅ Dry run completed", bucket)
 	} else {
-		log.Printf("Bucket %s: ✅ Successfully deleted %d versions", bucket, totalCount)
+		if hasErrors {
+			log.Printf("Bucket %s: ❌ Clean completed with errors (processed %d/%d)",
+				bucket, total, processedCount)
+		} else {
+			log.Printf("Bucket %s: ✅ Successfully deleted %d versions (%d remaining)",
+				bucket, processedCount, total-int64(processedCount))
+		}
 	}
 }

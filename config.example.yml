@@ -1,3 +1,4 @@
+---
 minio:
   # endpoint: "minio-ott.nsc.iudanet.com:443"
   endpoint: "minio.example.tld:443"
@@ -5,3 +6,6 @@ minio:
   accessKey: "accessKey"
   secretKey: "secretKey"
   useSSL: true
+
+cleaner:
+  maxObjectsPerRun: 100  # Можно изменить на нужное значение
