@@ -234,8 +234,10 @@ func bucketExists(client MinioClientInterface, name string) bool {
 	}
 	return exists
 }
+
 func processBucket(client MinioClientInterface, bucketName string) {
 	ctx := context.Background()
+	const ruleID = "auto-clean-versions"
 
 	lc, err := client.GetBucketLifecycle(ctx, bucketName)
 	if err != nil {
@@ -244,9 +246,10 @@ func processBucket(client MinioClientInterface, bucketName string) {
 			return
 		}
 
-		// Создаем новую политику
+		// Если политики нет вообще - создаем новую
 		newLC := createDefaultLifecycle()
-		if err := client.SetBucketLifecycle(ctx, bucketName, newLC); err != nil {
+		err := client.SetBucketLifecycle(ctx, bucketName, newLC)
+		if err != nil {
 			log.Printf("Bucket %s: ❌ Error setting lifecycle: %v", bucketName, err)
 			return
 		}
@@ -254,14 +257,35 @@ func processBucket(client MinioClientInterface, bucketName string) {
 		return
 	}
 
-	if hasCorrectPolicy(lc) {
+	// Ищем наше правило в существующей конфигурации
+	var ourRule *lifecycle.Rule
+	for i, rule := range lc.Rules {
+		if rule.ID == ruleID {
+			ourRule = &lc.Rules[i]
+			break
+		}
+	}
+
+	if ourRule == nil {
+		// Если правила нет - добавляем его к существующим
+		lc.Rules = append(lc.Rules, createDefaultLifecycle().Rules[0])
+	} else if !hasCorrectRule(ourRule) {
+		// Если правило есть, но не корректное - удаляем и добавляем заново
+		var removed bool
+		lc, removed = removeRuleByID(lc, ruleID)
+		if !removed {
+			log.Printf("Bucket %s: ⚠️ Failed to remove existing rule", bucketName)
+			return
+		}
+		lc.Rules = append(lc.Rules, createDefaultLifecycle().Rules[0])
+	} else {
+		// Правило уже корректное - ничего не делаем
 		log.Printf("Bucket %s: ✅ Policy already correct", bucketName)
 		return
 	}
 
-	// Обновляем существующую политику
-	updatedLC := updateLifecycleConfig(lc)
-	if err := client.SetBucketLifecycle(ctx, bucketName, updatedLC); err != nil {
+	// Применяем обновленную конфигурацию
+	if err := client.SetBucketLifecycle(ctx, bucketName, lc); err != nil {
 		log.Printf("Bucket %s: ❌ Error updating lifecycle: %v", bucketName, err)
 		return
 	}
@@ -275,8 +299,10 @@ func createDefaultLifecycle() *lifecycle.Configuration {
 				ID:     "auto-clean-versions",
 				Status: "Enabled",
 				NoncurrentVersionExpiration: lifecycle.NoncurrentVersionExpiration{
-					NoncurrentDays: lifecycle.ExpirationDays(1),
+					NoncurrentDays:          lifecycle.ExpirationDays(1),
+					NewerNoncurrentVersions: 1,
 				},
+				Expiration: lifecycle.Expiration{DeleteMarker: true},
 			},
 		},
 	}
@@ -284,35 +310,20 @@ func createDefaultLifecycle() *lifecycle.Configuration {
 
 func hasCorrectPolicy(lc *lifecycle.Configuration) bool {
 	for _, rule := range lc.Rules {
-		if rule.Status == "Enabled" &&
-			rule.NoncurrentVersionExpiration.NoncurrentDays == 1 {
+		if hasCorrectRule(&rule) {
 			return true
 		}
 	}
 	return false
 }
-
-func updateLifecycleConfig(existing *lifecycle.Configuration) *lifecycle.Configuration {
-	// Фильтруем существующие правила
-	var newRules []lifecycle.Rule
-	for _, rule := range existing.Rules {
-		if rule.ID != "auto-clean-versions" {
-			newRules = append(newRules, rule)
-		}
+func hasCorrectRule(rule *lifecycle.Rule) bool {
+	if rule.Status == "Enabled" &&
+		rule.NoncurrentVersionExpiration.NoncurrentDays == 1 &&
+		rule.NoncurrentVersionExpiration.NewerNoncurrentVersions == 1 &&
+		rule.Expiration.DeleteMarker {
+		return true
 	}
-
-	// Добавляем новое правило
-	newRules = append(newRules, lifecycle.Rule{
-		ID:     "auto-clean-versions",
-		Status: "Enabled",
-		NoncurrentVersionExpiration: lifecycle.NoncurrentVersionExpiration{
-			NoncurrentDays: lifecycle.ExpirationDays(1),
-		},
-	})
-
-	return &lifecycle.Configuration{
-		Rules: newRules,
-	}
+	return false
 }
 
 func cleanVersions(client MinioClientInterface, cfg *Config) {
@@ -431,4 +442,28 @@ func cleanSingleBucket(client MinioClientInterface, bucket string, cfg *Config) 
 				bucket, processedCount, total-int64(processedCount))
 		}
 	}
+}
+
+// removeRuleByID удаляет правило по ID из конфигурации жизненного цикла
+// Возвращает новую конфигурацию и флаг, было ли правило найдено и удалено
+func removeRuleByID(lfcCfg *lifecycle.Configuration, ilmID string) (*lifecycle.Configuration, bool) {
+	if lfcCfg == nil || len(lfcCfg.Rules) == 0 {
+		return lfcCfg, false
+	}
+
+	n := 0
+	for _, rule := range lfcCfg.Rules {
+		if rule.ID != ilmID {
+			lfcCfg.Rules[n] = rule
+			n++
+		}
+	}
+
+	if n == len(lfcCfg.Rules) {
+		// Правило не найдено
+		return lfcCfg, false
+	}
+
+	lfcCfg.Rules = lfcCfg.Rules[:n]
+	return lfcCfg, true
 }

@@ -39,6 +39,11 @@ clean:
 	rm -f coverage.out coverage.html
 	rm -f $(BINARY_NAME)
 
+update_deps:
+	@echo "${GREEN}Updating dependencies...${NC}"
+	go get -u ./...
+	go mod tidy
+
 # Помощь
 help:
 	@echo "Available commands:"
