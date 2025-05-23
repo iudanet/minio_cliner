@@ -130,7 +130,11 @@ func loadConfig(configPath string) (*Config, error) {
 	// Настройка чтения переменных окружения
 	v.SetEnvPrefix("MINIO")
 	v.AutomaticEnv()
-
+	// Явно связываем переменные среды с полями конфига
+	v.BindEnv("minio.endpoint", "MINIO_ENDPOINT")
+	v.BindEnv("minio.accessKey", "MINIO_ACCESS_KEY")
+	v.BindEnv("minio.secretKey", "MINIO_SECRET_KEY")
+	v.BindEnv("minio.useSSL", "MINIO_USE_SSL")
 	// Приоритет файла конфигурации над переменными окружения
 	if configPath != "" {
 		if err := v.ReadInConfig(); err != nil {
